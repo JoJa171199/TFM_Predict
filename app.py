@@ -4,11 +4,10 @@ import joblib
 import pandas as pd
 import numpy as np
 import unicodedata
-import os
 
-app = FastAPI(title="PropTech Valora API")
+app = FastAPI(title="PropTech Valora API - Madrid 2026")
 
-# Permitir conexiones externas (CORS) para que n8n o tu web no sean bloqueados
+# CORS: Permite que n8n o cualquier web consulte tu API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,79 +15,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- UTILIDADES ---
-def normalizar_texto(texto):
-    """Elimina tildes, espacios y convierte a minúsculas para comparaciones robustas."""
-    if not isinstance(texto, str): return ""
-    texto = unicodedata.normalize('NFD', texto)
-    texto = texto.encode('ascii', 'ignore').decode("utf-8")
-    return texto.strip().lower()
-
-# --- CARGA DE ACTIVOS (Al iniciar el servidor) ---
+# --- CARGA DE ACTIVOS ---
 try:
     model = joblib.load('modelo_turbo_madrid.pkl')
     features_names = joblib.load('features_list.pkl')
     df_context = pd.read_csv('data_context.csv')
-    # Normalizamos los nombres de los barrios en la base de datos una sola vez
-    df_context['neighborhood_norm'] = df_context['neighborhood'].apply(normalizar_texto)
-    print("✅ Activos cargados y barrios normalizados.")
+    print("✅ Activos cargados con éxito.")
 except Exception as e:
-    print(f"❌ Error crítico en la carga de archivos: {e}")
+    print(f"❌ Error al cargar activos: {e}")
 
-# --- ENDPOINTS ---
+# --- UTILIDADES ---
+def normalizar(texto):
+    """Estandariza nombres de barrios (sin tildes, minúsculas)."""
+    if not isinstance(texto, str): return ""
+    return "".join(c for c in unicodedata.normalize('NFD', texto.lower().strip())
+                  if unicodedata.category(c) != 'Mn')
+
+# Pre-normalizar la base de datos para rapidez
+df_context['neighborhood_norm'] = df_context['neighborhood'].apply(normalizar)
 
 @app.get("/")
-def health_check():
-    """Endpoint para que Render sepa que la API está viva."""
-    return {"status": "online", "model": "Turbo Opción A"}
+def home():
+    return {"message": "PropTech Valora API Online", "version": "1.0.0"}
 
 @app.post("/predict")
 def predict(data: dict):
     try:
-        # 1. Validación de entrada básica
-        required = ['neighborhood', 'size_m2', 'rooms', 'bathrooms']
-        for field in required:
-            if field not in data:
-                raise HTTPException(status_code=400, detail=f"Falta el campo: {field}")
+        # 1. Obtener datos de entrada (desde n8n/Usuario)
+        barrio_input = normalizar(data.get('neighborhood', ''))
+        size = float(data.get('size_m2', 0))
+        rooms = int(data.get('rooms', 0))
+        bathrooms = int(data.get('bathrooms', 0))
 
-        # 2. Búsqueda robusta del barrio
-        barrio_buscado = normalizar_texto(data['neighborhood'])
-        match = df_context[df_context['neighborhood_norm'] == barrio_buscado]
-
+        # 2. Buscar contexto social del barrio
+        match = df_context[df_context['neighborhood_norm'] == barrio_input]
         if match.empty:
-            raise HTTPException(status_code=404, detail=f"El barrio '{data['neighborhood']}' no se encuentra en la base de datos de Madrid.")
+            raise HTTPException(status_code=404, detail=f"Barrio '{data['neighborhood']}' no encontrado.")
         
-        barrio_data = match.iloc[0]
+        social = match.iloc[0]
 
-        # 3. Construcción del vector de entrada (Feature Engineering)
-        input_dict = {
-            'size_m2': float(data['size_m2']),
-            'rooms': int(data['rooms']),
-            'bathrooms': int(data['bathrooms']),
-            'Renta_neta_media_hogar': float(barrio_data['Renta_neta_media_hogar']),
-            'Indice_Criminalidad': float(barrio_data['Indice_Criminalidad']),
-            'Indice_Calidad_Aire': float(barrio_data['Indice_Calidad_Aire']),
-            # Interacciones calculadas igual que en el entrenamiento
-            'Renta_x_Size': float(barrio_data['Renta_neta_media_hogar']) * float(data['size_m2']),
-            'Renta_x_Rooms': float(barrio_data['Renta_neta_media_hogar']) * int(data['rooms'])
+        # 3. Recrear variables del modelo (incluyendo interacciones del Modelo Turbo)
+        renta = float(social['Renta_neta_media_hogar'])
+        
+        input_data = {
+            'size_m2': size,
+            'rooms': rooms,
+            'bathrooms': bathrooms,
+            'Renta_neta_media_hogar': renta,
+            'Indice_Criminalidad': float(social['Indice_Criminalidad']),
+            'Indice_Calidad_Aire': float(social['Indice_Calidad_Aire']),
+            'Renta_x_Size': renta * size,
+            'Renta_x_Rooms': renta * rooms
         }
 
-        # Convertir a DataFrame asegurando el orden exacto de las columnas
-        df_input = pd.DataFrame([input_dict])[features_names]
+        # Asegurar orden de columnas del modelo
+        df_final = pd.DataFrame([input_data])[features_names]
 
-        # 4. Predicción y reversión del Logaritmo
-        prediction_log = model.predict(df_input)
-        precio_m2 = np.expm1(prediction_log)[0]
-        precio_total = precio_m2 * data['size_m2']
+        # 4. Predicción (Log-reversión)
+        pred_log = model.predict(df_final)
+        precio_m2 = np.expm1(pred_log)[0]
+        precio_total = precio_m2 * size
 
         return {
             "success": True,
-            "barrio_oficial": barrio_data['neighborhood'],
-            "precio_m2_estimado": round(float(precio_m2), 2),
-            "precio_total_estimado": round(float(precio_total), 2),
-            "contexto": {
-                "renta": round(barrio_data['Renta_neta_media_hogar'], 2),
-                "seguridad": round(barrio_data['Indice_Criminalidad'], 2)
+            "neighborhood": social['neighborhood'],
+            "valuation": {
+                "price_m2": round(float(precio_m2), 2),
+                "total_price": round(float(precio_total), 2)
+            },
+            "socioeconomic": {
+                "renta_media_hogar": renta,
+                "indice_criminalidad": social['Indice_Criminalidad']
             }
         }
 
