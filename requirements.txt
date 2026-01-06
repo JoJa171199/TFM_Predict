@@ -1,7 +1,7 @@
-fastapi==0.115.0
-uvicorn==0.34.0
 pandas==2.2.2
 scikit-learn==1.6.1
 lightgbm==4.6.0
 joblib==1.5.3
-python-multipart
+fastapi==0.123.10
+uvicorn==0.38.0
+python-multipart  
