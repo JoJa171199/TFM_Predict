@@ -1,100 +1,81 @@
-import pandas as pd
-import joblib
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import uvicorn
+import joblib
+import pandas as pd
+import numpy as np
 import os
 
-# 1. INICIALIZACIÓN DE LA APP
-app = FastAPI(title="PropTech Valora API", description="API de valoración inmobiliaria para Madrid", version="1.0")
+app = FastAPI(title="API Predicción Precios Madrid (LGBM)")
 
-# 2. CARGA DE ARTEFACTOS (Se ejecuta una sola vez al arrancar)
-print("Cargando modelos y datos...")
-
+# 1. Cargar el modelo y la lista de features al inicio
+# Usamos try/except para facilitar el debug en los logs de Render
 try:
-    # Cargar el modelo entrenado
-    model = joblib.load("modelo_turbo_madrid.pkl")
-    
-    # Cargar la lista de columnas para asegurar el orden exacto
-    expected_features = joblib.load("features_list.pkl")
-    
-    # Cargar el contexto de barrios (convertimos a diccionario para búsqueda rápida)
-    # El index será el nombre del barrio (en minúsculas para evitar errores)
-    df_context = pd.read_csv("data_context.csv")
-    df_context['neighborhood_norm'] = df_context['neighborhood'].str.lower().str.strip()
-    context_dict = df_context.set_index('neighborhood_norm').to_dict(orient='index')
-    
-    print("✅ Sistema cargado correctamente.")
-
+    model = joblib.load('modelo_turbo_madrid.pkl')
+    features_names = joblib.load('features_list.pkl')
+    print("✅ Modelo y Features cargados correctamente.")
+    print(f"📋 Features esperadas: {features_names}")
 except Exception as e:
-    print(f"❌ Error crítico al cargar archivos: {e}")
-    raise e
+    print(f"❌ Error fatal cargando archivos .pkl: {e}")
+    model = None
+    features_names = []
 
-# 3. DEFINICIÓN DEL FORMATO DE ENTRADA (Input del Usuario)
-class PropertyInput(BaseModel):
-    neighborhood: str
+# 2. Definir el esquema EXACTO que envía n8n (Las 8 features + inputs raw)
+class InputData(BaseModel):
+    # Datos básicos (necesarios para cálculo final)
     size_m2: float
-    rooms: int
-    bathrooms: int
+    
+    # Las 8 Features que el modelo exige (calculadas previamente en n8n)
+    rooms: float
+    bathrooms: float
+    # Nota: size_m2 ya está arriba
+    Renta_neta_media_hogar: float
+    Indice_Criminalidad: float
+    Indice_Calidad_Aire: float
+    Renta_x_Size: float
+    Renta_x_Rooms: float
 
-# 4. ENDPOINT DE PREDICCIÓN
+@app.get("/")
+def home():
+    return {"status": "online", "model": "LGBM Regressor Log-Scale"}
+
 @app.post("/predict")
-def predict_price(data: PropertyInput):
-    # A. Normalizar nombre del barrio
-    barrio_key = data.neighborhood.lower().strip()
+def predict(data: InputData):
+    if not model:
+        raise HTTPException(status_code=500, detail="El modelo no está cargado.")
     
-    # B. Buscar contexto del barrio
-    if barrio_key not in context_dict:
-        raise HTTPException(status_code=404, detail=f"Barrio '{data.neighborhood}' no encontrado en la base de datos.")
-    
-    ctx = context_dict[barrio_key]
-    
-    # C. Obtener variables base
-    renta = ctx['Renta_neta_media_hogar']
-    criminalidad = ctx['Indice_Criminalidad']
-    aire = ctx['Indice_Calidad_Aire']
-    
-    # D. Ingeniería de Features (Calculadas en tiempo real)
-    # Asumimos interacción directa (multiplicación) basada en los nombres
-    renta_x_size = renta * data.size_m2
-    renta_x_rooms = renta * data.rooms
-    
-    # E. Construir el DataFrame de entrada (Una sola fila)
-    input_data = {
-        'size_m2': data.size_m2,
-        'rooms': data.rooms,
-        'bathrooms': data.bathrooms,
-        'Renta_neta_media_hogar': renta,
-        'Indice_Criminalidad': criminalidad,
-        'Indice_Calidad_Aire': aire,
-        'Renta_x_Size': renta_x_size,
-        'Renta_x_Rooms': renta_x_rooms
-    }
-    
-    # Convertir a DataFrame y reordenar columnas según features_list.pkl
-    df_input = pd.DataFrame([input_data])
-    
-    # Asegurar que el orden sea EXACTAMENTE el que espera el modelo
     try:
-        df_input = df_input[expected_features]
-    except KeyError as e:
-        missing = set(expected_features) - set(df_input.columns)
-        raise HTTPException(status_code=500, detail=f"Faltan columnas calculadas: {missing}")
-
-    # F. Predicción
-    prediction = model.predict(df_input)[0]
-    
-    return {
-        "barrio": ctx['neighborhood'], # Devolvemos el nombre oficial del CSV
-        "precio_estimado": round(prediction, 2),
-        "moneda": "EUR",
-        "factores_contexto": {
-            "renta_zona": renta,
-            "seguridad": criminalidad,
-            "calidad_aire": aire
+        # 3. Mapear los datos entrantes al DataFrame en el ORDEN EXACTO del entrenamiento
+        # Creamos un diccionario temporal para asegurar el orden
+        input_payload = {
+            'size_m2': data.size_m2,
+            'rooms': data.rooms,
+            'bathrooms': data.bathrooms,
+            'Renta_neta_media_hogar': data.Renta_neta_media_hogar,
+            'Indice_Criminalidad': data.Indice_Criminalidad,
+            'Indice_Calidad_Aire': data.Indice_Calidad_Aire,
+            'Renta_x_Size': data.Renta_x_Size,
+            'Renta_x_Rooms': data.Renta_x_Rooms
         }
-    }
-
-# 5. PUNTO DE ENTRADA PARA DESARROLLO LOCAL
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        
+        # Crear DataFrame filtrando solo las columnas que el modelo conoce
+        df_input = pd.DataFrame([input_payload])[features_names]
+        
+        # 4. Predicción (El modelo devuelve Logaritmo)
+        prediction_log = model.predict(df_input)[0]
+        
+        # 5. Transformación Inversa (Log -> Euros)
+        precio_m2_estimado = np.expm1(prediction_log)
+        
+        # 6. Cálculo del Total
+        precio_total = precio_m2_estimado * data.size_m2
+        
+        return {
+            "precio_m2_estimado": round(float(precio_m2_estimado), 2),
+            "precio_total_estimado": round(float(precio_total), 2),
+            "moneda": "EUR",
+            "log_value_debug": float(prediction_log) # Para debug
+        }
+        
+    except Exception as e:
+        print(f"Error en predicción: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
